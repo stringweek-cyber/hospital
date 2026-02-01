@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>복약 기록 앱</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel CDN (JSX 컴파일용) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons Library -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;700;900&display=swap');
+        body { font-family: 'Pretendard', sans-serif; }
+        /* Lucide 아이콘 크기 조절을 위한 클래스 */
+        .lucide { width: 1em; height: 1em; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect } = React;
+
+        const App = () => {
+            const [activeProfile, setSelectedProfile] = useState('me'); // 'me', 'son', 'stats'
+            const [selectedDate, setSelectedDate] = useState(new Date());
+            const [viewDate, setViewDate] = useState(new Date());
+            const [records, setRecords] = useState({ me: {}, son: {} });
+            const [hospitals, setHospitals] = useState(['내과', '소아과', '이비인후과', '피부과', '치과']);
+            const [newKeyword, setNewKeyword] = useState('');
+            const [showToast, setShowToast] = useState(null);
+
+            const profileNames = { me: '나의 기록', son: '아들 기록', stats: '전체 누계' };
+            const currentYear = new Date().getFullYear();
+
+            // 아이콘 렌더링을 위한 useEffect
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, [activeProfile, viewDate, selectedDate, records]);
+
+            // 로컬 시간 기준 날짜 포맷 (1월 1일 리셋 및 시간대 버그 방지)
+            const formatDate = (date) => {
+                const y = date.getFullYear();
+                const m = String(date.getMonth() + 1).padStart(2, '0');
+                const d = String(date.getDate()).padStart(2, '0');
+                return `${y}-${m}-${d}`;
+            };
+
+            const isSameDay = (d1, d2) => 
+                d1.getFullYear() === d2.getFullYear() &&
+                d1.getMonth() === d2.getMonth() &&
+                d1.getDate() === d2.getDate();
+
+            const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
+            const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
+
+            // 1월 1일 기준 리셋을 위한 필터링 (현재 연도 데이터만)
+            const filteredRecords = useMemo(() => {
+                const filterByYear = (data) => {
+                    const filtered = {};
+                    Object.keys(data).forEach(dateStr => {
+                        if (dateStr.startsWith(`${currentYear}-`)) {
+                            filtered[dateStr] = data[dateStr];
+                        }
+                    });
+                    return filtered;
+                };
+                return { me: filterByYear(records.me), son: filterByYear(records.son) };
+            }, [records, currentYear]);
+
+            const getUniqueDayCount = (profile) => Object.keys(filteredRecords[profile]).length;
+
+            const getRanking = (profile) => {
+                const counts = {};
+                Object.values(filteredRecords[profile]).forEach(list => {
+                    list.forEach(h => { counts[h] = (counts[h] || 0) + 1; });
+                });
+                return Object.entries(counts)
+                    .sort(([, a], [, b]) => b - a)
+                    .map(([hospital, count]) => ({ hospital, count }));
+            };
+
+            const getMonthlyStats = () => {
+                const stats = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, me: 0, son: 0 }));
+                ['me', 'son'].forEach(profile => {
+                    Object.keys(filteredRecords[profile]).forEach(dateStr => {
+                        const month = parseInt(dateStr.split('-')[1], 10);
+                        stats[month - 1][profile] += filteredRecords[profile][dateStr].length;
+                    });
+                });
+                return stats;
+            };
+
+            const addRecord = (hospital) => {
+                const dateStr = formatDate(selectedDate);
+                const currentDayRecords = records[activeProfile][dateStr] || [];
+                if (currentDayRecords.includes(hospital)) {
+                    triggerToast('이미 기록된 병원입니다.');
+                    return;
+                }
+                setRecords(prev => ({
+                    ...prev,
+                    [activeProfile]: { ...prev[activeProfile], [dateStr]: [...currentDayRecords, hospital] }
+                }));
+                triggerToast(`${hospital} 기록 완료!`);
+            };
+
+            const deleteDayRecord = (hospitalName) => {
+                const dateStr = formatDate(selectedDate);
+                const updatedList = records[activeProfile][dateStr].filter(h => h !== hospitalName);
+                setRecords(prev => {
+                    const newProfileRecords = { ...prev[activeProfile] };
+                    if (updatedList.length === 0) delete newProfileRecords[dateStr];
+                    else newProfileRecords[dateStr] = updatedList;
+                    return { ...prev, [activeProfile]: newProfileRecords };
+                });
+            };
+
+            const addHospitalKeyword = (e) => {
+                e.preventDefault();
+                if (!newKeyword.trim() || hospitals.includes(newKeyword.trim())) {
+                    setNewKeyword('');
+                    return;
+                }
+                setHospitals([...hospitals, newKeyword.trim()]);
+                setNewKeyword('');
+            };
+
+            const deleteHospitalKeyword = (keyword) => {
+                setHospitals(hospitals.filter(h => h !== keyword));
+            };
+
+            const triggerToast = (msg) => {
+                setShowToast(msg);
+                setTimeout(() => setShowToast(null), 2000);
+            };
+
+            const renderCalendar = () => {
+                const year = viewDate.getFullYear();
+                const month = viewDate.getMonth();
+                const daysInMonth = getDaysInMonth(year, month);
+                const firstDay = getFirstDayOfMonth(year, month);
+                const days = [];
+                for (let i = 0; i < firstDay; i++) days.push(<div key={`empty-${i}`} className="h-14"></div>);
+                const currentProfile = activeProfile === 'stats' ? 'me' : activeProfile;
+                for (let d = 1; d <= daysInMonth; d++) {
+                    const current = new Date(year, month, d);
+                    const isSelected = isSameDay(current, selectedDate);
+                    const dateStr = formatDate(current);
+                    const dayRecords = filteredRecords[currentProfile][dateStr] || [];
+                    const hasRecord = dayRecords.length > 0;
+                    const dayOfWeek = current.getDay();
+                    let textColor = 'text-slate-700';
+                    if (!isSelected) {
+                        if (dayOfWeek === 0) textColor = 'text-red-500';
+                        else if (dayOfWeek === 6) textColor = 'text-blue-600';
+                    }
+                    let bgClass = isSelected ? 'bg-blue-600 text-white shadow-md z-10 scale-105' : hasRecord ? 'bg-blue-50 font-bold border border-blue-100' : 'hover:bg-gray-50';
+                    days.push(
+                        <div key={d} onClick={() => setSelectedDate(current)}
+                             className={`h-14 flex flex-col items-center pt-1 cursor-pointer rounded-xl transition-all relative ${bgClass} ${isSelected ? '' : textColor}`}>
+                            <span className="text-xl font-black leading-none">{d}</span>
+                            <div className="w-full px-0.5 mt-0.5 space-y-0.5 overflow-hidden">
+                                {dayRecords.slice(0, 1).map((h, i) => (
+                                    <span key={i} className={`text-[8px] leading-tight block truncate w-full text-center ${isSelected ? 'text-blue-100' : 'text-blue-700 font-bold'}`}>{h}</span>
+                                ))}
+                            </div>
+                        </div>
+                    );
+                }
+                return days;
+            };
+
+            const dateStr = formatDate(selectedDate);
+            const currentDayRecords = filteredRecords[activeProfile]?.[dateStr] || [];
+
+            return (
+                <div className="flex flex-col h-screen max-w-md mx-auto bg-slate-50 text-slate-800 overflow-hidden border-x border-slate-200">
+                    {activeProfile !== 'stats' && (
+                        <header className="bg-white px-6 pt-6 pb-4 shadow-sm rounded-b-[2.5rem] z-10 border-b border-slate-100">
+                            <div className="flex justify-between items-center mb-4">
+                                <div className="flex items-center">
+                                    <div className="w-1.5 h-6 bg-blue-500 rounded-full mr-2"></div>
+                                    <h1 className="text-xl font-black text-slate-900 tracking-tight">복약 기록</h1>
+                                </div>
+                                <div className="flex gap-2">
+                                    <div className="bg-slate-50 px-2.5 py-1 rounded-xl border border-slate-100 text-center min-w-[50px]">
+                                        <p className="text-[8px] text-slate-400 font-bold">나</p>
+                                        <p className="text-sm font-black text-blue-600">{getUniqueDayCount('me')}<span className="text-[9px] font-normal text-slate-400 ml-0.5">일</span></p>
+                                    </div>
+                                    <div className="bg-slate-50 px-2.5 py-1 rounded-xl border border-slate-100 text-center min-w-[50px]">
+                                        <p className="text-[8px] text-slate-400 font-bold">아들</p>
+                                        <p className="text-sm font-black text-indigo-500">{getUniqueDayCount('son')}<span className="text-[9px] font-normal text-slate-400 ml-0.5">일</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="flex items-center justify-between mb-3 px-1">
+                                <h2 className="text-md font-bold text-slate-800">{viewDate.getFullYear()}년 {viewDate.getMonth() + 1}월</h2>
+                                <div className="flex gap-1 bg-slate-50 rounded-full p-0.5">
+                                    <button onClick={() => changeMonth(-1)} className="p-1 hover:bg-white hover:shadow-xs rounded-full transition-all"><i data-lucide="chevron-left" className="lucide"></i></button>
+                                    <button onClick={() => changeMonth(1)} className="p-1 hover:bg-white hover:shadow-xs rounded-full transition-all"><i data-lucide="chevron-right" className="lucide"></i></button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-7 mb-1 text-center text-[10px] font-extrabold tracking-tighter uppercase">
+                                {['일', '월', '화', '수', '목', '금', '토'].map((d, i) => (
+                                    <div key={d} className={i === 0 ? 'text-red-400' : i === 6 ? 'text-blue-400' : 'text-slate-300'}>{d}</div>
+                                ))}
+                            </div>
+                            <div className="grid grid-cols-7 gap-0.5">{renderCalendar()}</div>
+                        </header>
+                    )}
+
+                    <main className="flex-1 overflow-y-auto p-5 pb-24">
+                        {activeProfile === 'stats' ? (
+                            <div className="space-y-6 pt-2">
+                                <div className="flex items-center gap-2 mb-2">
+                                    <div className="w-1.5 h-6 bg-slate-900 rounded-full"></div>
+                                    <h3 className="font-black text-slate-900 text-xl">{currentYear}년 전체 누계</h3>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 text-center">
+                                        <div className="flex items-center justify-center gap-2 mb-3 border-b pb-3 text-blue-600">
+                                            <i data-lucide="user" className="lucide"></i><p className="text-base font-black">나의 기록</p>
+                                        </div>
+                                        <p className="text-3xl font-black text-blue-600 mb-4">{getUniqueDayCount('me')}<span className="text-sm font-normal text-slate-400 ml-1">일</span></p>
+                                        <div className="space-y-3">
+                                            {getRanking('me').map((item, idx) => (
+                                                <div key={idx} className="flex justify-between items-center text-sm font-bold text-slate-600">
+                                                    <span>{idx + 1}. {item.hospital}</span><span>{item.count}회</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 text-center">
+                                        <div className="flex items-center justify-center gap-2 mb-3 border-b pb-3 text-indigo-600">
+                                            <i data-lucide="baby" className="lucide"></i><p className="text-base font-black">아들 기록</p>
+                                        </div>
+                                        <p className="text-3xl font-black text-indigo-600 mb-4">{getUniqueDayCount('son')}<span className="text-sm font-normal text-slate-400 ml-1">일</span></p>
+                                        <div className="space-y-3">
+                                            {getRanking('son').map((item, idx) => (
+                                                <div key={idx} className="flex justify-between items-center text-sm font-bold text-slate-600">
+                                                    <span>{idx + 1}. {item.hospital}</span><span>{item.count}회</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100">
+                                    <p className="text-base font-black text-slate-400 uppercase mb-5 tracking-widest text-center">월별 복약 횟수 비교</p>
+                                    <table className="w-full text-lg text-center overflow-hidden rounded-2xl">
+                                        <thead className="bg-slate-50 text-slate-500 font-bold">
+                                            <tr><th className="py-4 border-b">월</th><th className="py-4 border-b text-blue-600">나</th><th className="py-4 border-b text-indigo-600">아들</th></tr>
+                                        </thead>
+                                        <tbody>
+                                            {getMonthlyStats().filter(s => s.me > 0 || s.son > 0).map((s) => (
+                                                <tr key={s.month} className="border-b border-slate-50 last:border-0 font-black text-slate-700">
+                                                    <td className="py-4 text-slate-500">{s.month}월</td><td>{s.me}회</td><td>{s.son}회</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        ) : (
+                            <>
+                                <div className="flex items-center justify-between mb-4">
+                                    <div className="flex items-center gap-2">
+                                        <div className="w-1.5 h-6 bg-blue-500 rounded-full"></div>
+                                        <h3 className="font-extrabold text-slate-800 text-sm">
+                                            {selectedDate.getMonth() + 1}/{selectedDate.getDate()} {profileNames[activeProfile]}
+                                        </h3>
+                                    </div>
+                                </div>
+                                <div className="flex flex-wrap gap-2 mb-4">
+                                    {currentDayRecords.map((h, i) => (
+                                        <div key={i} className="flex items-center gap-1.5 bg-blue-600 text-white px-3 py-1.5 rounded-xl text-[11px] font-bold shadow-sm animate-in fade-in slide-in-from-left-2">
+                                            {h}
+                                            <button onClick={() => deleteDayRecord(h)} className="p-0.5 hover:text-red-200 transition-colors"><i data-lucide="x" className="lucide"></i></button>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-100">
+                                    <div className="flex flex-wrap gap-2.5">
+                                        {hospitals.map(hospital => (
+                                            <div key={hospital} className={`flex items-center border rounded-2xl pl-3 pr-1.5 py-1.5 transition-all ${currentDayRecords.includes(hospital) ? 'bg-blue-100 border-blue-200 text-blue-700 font-bold' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-blue-50 font-bold'}`}>
+                                                <button onClick={() => addRecord(hospital)} className="text-xs mr-2">{hospital}</button>
+                                                <button onClick={() => deleteHospitalKeyword(hospital)} className="p-0.5 text-slate-300 hover:text-red-500 transition-colors"><i data-lucide="x" className="lucide"></i></button>
+                                            </div>
+                                        ))}
+                                        <form onSubmit={addHospitalKeyword} className="flex items-center bg-white border-2 border-dashed border-slate-100 rounded-2xl px-3 py-1">
+                                            <input type="text" value={newKeyword} onChange={(e) => setNewKeyword(e.target.value)} placeholder="병원 추가" className="bg-transparent text-[11px] w-16 outline-none font-medium text-slate-500" />
+                                            <button type="submit" className="text-blue-400 ml-1"><i data-lucide="plus" className="lucide"></i></button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </main>
+
+                    {showToast && (
+                        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-900/90 backdrop-blur-sm text-white px-5 py-2.5 rounded-2xl text-xs font-bold z-50 shadow-2xl animate-in zoom-in">
+                            <div className="flex items-center gap-2"><i data-lucide="check-circle-2" className="text-green-400 lucide"></i>{showToast}</div>
+                        </div>
+                    )}
+
+                    <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white/95 backdrop-blur-md border-t border-slate-100 flex items-center rounded-t-[2.5rem] shadow-lg h-20">
+                        <button onClick={() => setSelectedProfile('me')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'me' ? 'text-blue-600' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'me' ? 'bg-blue-50' : ''}`}><i data-lucide="user" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">나의 기록</span>
+                        </button>
+                        <button onClick={() => setSelectedProfile('son')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'son' ? 'text-indigo-600' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'son' ? 'bg-indigo-50' : ''}`}><i data-lucide="baby" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">아들 기록</span>
+                        </button>
+                        <button onClick={() => setSelectedProfile('stats')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'stats' ? 'text-slate-900' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'stats' ? 'bg-slate-100' : ''}`}><i data-lucide="bar-chart-2" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">누계</span>
+                        </button>
+                    </nav>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
