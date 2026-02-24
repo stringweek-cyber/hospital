@@ -36,6 +36,482 @@
         const App = () => {
             const [sdkReady, setSdkReady] = useState(false);
             const [user, setUser] = useState(null);
+            const [loadingError, setLoadingError] = useState(null); // 에러 상태 추가
+            
+            const [activeProfile, setSelectedProfile] = useState('me');
+            const [selectedDate, setSelectedDate] = useState(new Date());
+            const [viewDate, setViewDate] = useState(new Date());
+            const [records, setRecords] = useState({ me: {}, son: {} });
+            const [hospitals, setHospitals] = useState(['내과', '소아과', '이비인후과', '피부과', '치과']);
+            const [newKeyword, setNewKeyword] = useState('');
+            const [showToast, setShowToast] = useState(null);
+
+            const firebaseRef = useRef({ db: null, auth: null });
+            const profileNames = { me: '나의 기록', son: '아들 기록', stats: '전체 누계' };
+            const currentYear = new Date().getFullYear();
+
+            // 1. SDK 로드 확인 및 Firebase 초기화 (타임아웃 추가)
+            useEffect(() => {
+                let retryCount = 0;
+                const checkSDK = setInterval(() => {
+                    retryCount++;
+                    if (window.FirebaseSDK) {
+                        const { initializeApp, getAuth, getFirestore } = window.FirebaseSDK;
+                        try {
+                            // 설정값이 없는 경우에 대한 예외 처리
+                            const configStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+                            if (!configStr) {
+                                throw new Error("Firebase 설정 정보가 없습니다.");
+                            }
+
+                            const firebaseConfig = JSON.parse(configStr);
+                            const app = initializeApp(firebaseConfig);
+                            firebaseRef.current.auth = getAuth(app);
+                            firebaseRef.current.db = getFirestore(app);
+                            setSdkReady(true);
+                            clearInterval(checkSDK);
+                        } catch (e) {
+                            console.error("Firebase Init Error:", e);
+                            setLoadingError("Firebase 설정을 불러올 수 없습니다.");
+                            clearInterval(checkSDK);
+                        }
+                    }
+
+                    if (retryCount > 50) { // 5초 이상 응답 없을 때
+                        setLoadingError("서버 연결 응답 시간이 초과되었습니다.");
+                        clearInterval(checkSDK);
+                    }
+                }, 100);
+                return () => clearInterval(checkSDK);
+            }, []);
+
+            // 2. 인증 처리
+            useEffect(() => {
+                if (!sdkReady) return;
+                const { onAuthStateChanged, signInAnonymously, signInWithCustomToken } = window.FirebaseSDK;
+                const auth = firebaseRef.current.auth;
+
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (e) {
+                        console.error("Auth Error:", e);
+                        setLoadingError("사용자 인증에 실패했습니다.");
+                    }
+                };
+                initAuth();
+                const unsubscribe = onAuthStateChanged(auth, setUser);
+                return () => unsubscribe();
+            }, [sdkReady]);
+
+            // 3. 데이터 실시간 동기화
+            useEffect(() => {
+                if (!user || !sdkReady) return;
+                const { doc, onSnapshot } = window.FirebaseSDK;
+                const db = firebaseRef.current.db;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+
+                const recordsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'records');
+                const unsubscribeRecords = onSnapshot(recordsDocRef, (docSnap) => {
+                    if (docSnap.exists()) setRecords(docSnap.data());
+                }, (err) => console.error("Records sync fail:", err));
+
+                const hospitalsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals');
+                const unsubscribeHospitals = onSnapshot(hospitalsDocRef, (docSnap) => {
+                    if (docSnap.exists()) setHospitals(docSnap.data().list);
+                }, (err) => console.error("Hospitals sync fail:", err));
+
+                return () => {
+                    unsubscribeRecords();
+                    unsubscribeHospitals();
+                };
+            }, [user, sdkReady]);
+
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, [activeProfile, viewDate, selectedDate, records, user, sdkReady]);
+
+            const formatDate = (date) => {
+                const y = date.getFullYear();
+                const m = String(date.getMonth() + 1).padStart(2, '0');
+                const d = String(date.getDate()).padStart(2, '0');
+                return `${y}-${m}-${d}`;
+            };
+
+            const isSameDay = (d1, d2) => 
+                d1.getFullYear() === d2.getFullYear() &&
+                d1.getMonth() === d2.getMonth() &&
+                d1.getDate() === d2.getDate();
+
+            const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
+            const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
+
+            const changeMonth = (offset) => {
+                setViewDate(prev => new Date(prev.getFullYear(), prev.getMonth() + offset, 1));
+            };
+
+            const filteredRecords = useMemo(() => {
+                const filterByYear = (data = {}) => {
+                    const filtered = {};
+                    Object.keys(data).forEach(dateStr => {
+                        if (dateStr.startsWith(`${currentYear}-`)) {
+                            filtered[dateStr] = data[dateStr];
+                        }
+                    });
+                    return filtered;
+                };
+                return { 
+                    me: filterByYear(records?.me || {}), 
+                    son: filterByYear(records?.son || {}) 
+                };
+            }, [records, currentYear]);
+
+            const getUniqueDayCount = (profile) => Object.keys(filteredRecords[profile] || {}).length;
+
+            const getRanking = (profile) => {
+                const counts = {};
+                Object.values(filteredRecords[profile] || {}).forEach(list => {
+                    list.forEach(h => { counts[h] = (counts[h] || 0) + 1; });
+                });
+                return Object.entries(counts)
+                    .sort(([, a], [, b]) => b - a)
+                    .map(([hospital, count]) => ({ hospital, count }));
+            };
+
+            const getMonthlyStats = () => {
+                const stats = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, me: 0, son: 0 }));
+                ['me', 'son'].forEach(profile => {
+                    Object.keys(filteredRecords[profile] || {}).forEach(dateStr => {
+                        const month = parseInt(dateStr.split('-')[1], 10);
+                        if (stats[month - 1]) stats[month - 1][profile] += filteredRecords[profile][dateStr].length;
+                    });
+                });
+                return stats;
+            };
+
+            const saveRecords = async (newRecords) => {
+                if (!user || !sdkReady) return;
+                const { doc, setDoc } = window.FirebaseSDK;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+                await setDoc(doc(firebaseRef.current.db, 'artifacts', appId, 'users', user.uid, 'data', 'records'), newRecords);
+            };
+
+            const saveHospitals = async (newList) => {
+                if (!user || !sdkReady) return;
+                const { doc, setDoc } = window.FirebaseSDK;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+                await setDoc(doc(firebaseRef.current.db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals'), { list: newList });
+            };
+
+            const addRecord = async (hospital) => {
+                const dateStr = formatDate(selectedDate);
+                const currentDayRecords = records[activeProfile]?.[dateStr] || [];
+                if (currentDayRecords.includes(hospital)) {
+                    triggerToast('이미 기록된 병원입니다.');
+                    return;
+                }
+                const updatedRecords = {
+                    ...records,
+                    [activeProfile]: { ...records[activeProfile], [dateStr]: [...currentDayRecords, hospital] }
+                };
+                await saveRecords(updatedRecords);
+                triggerToast(`${hospital} 기록 완료!`);
+            };
+
+            const deleteDayRecord = async (hospitalName) => {
+                const dateStr = formatDate(selectedDate);
+                const updatedList = (records[activeProfile]?.[dateStr] || []).filter(h => h !== hospitalName);
+                const newProfileRecords = { ...records[activeProfile] };
+                if (updatedList.length === 0) delete newProfileRecords[dateStr];
+                else newProfileRecords[dateStr] = updatedList;
+                await saveRecords({ ...records, [activeProfile]: newProfileRecords });
+            };
+
+            const addHospitalKeyword = async (e) => {
+                e.preventDefault();
+                const trimmed = newKeyword.trim();
+                if (!trimmed || hospitals.includes(trimmed)) {
+                    setNewKeyword('');
+                    return;
+                }
+                await saveHospitals([...hospitals, trimmed]);
+                setNewKeyword('');
+            };
+
+            const deleteHospitalKeyword = async (keyword) => {
+                await saveHospitals(hospitals.filter(h => h !== keyword));
+            };
+
+            const triggerToast = (msg) => {
+                setShowToast(msg);
+                setTimeout(() => setShowToast(null), 2000);
+            };
+
+            const renderCalendar = () => {
+                const year = viewDate.getFullYear();
+                const month = viewDate.getMonth();
+                const daysInMonth = getDaysInMonth(year, month);
+                const firstDay = getFirstDayOfMonth(year, month);
+                const days = [];
+                for (let i = 0; i < firstDay; i++) days.push(<div key={`empty-${i}`} className="h-14"></div>);
+                
+                const displayProfile = activeProfile === 'stats' ? 'me' : activeProfile;
+                for (let d = 1; d <= daysInMonth; d++) {
+                    const current = new Date(year, month, d);
+                    const isSelected = isSameDay(current, selectedDate);
+                    const dateStr = formatDate(current);
+                    const dayRecords = filteredRecords[displayProfile]?.[dateStr] || [];
+                    const hasRecord = dayRecords.length > 0;
+                    const dayOfWeek = current.getDay();
+                    
+                    let textColor = 'text-slate-700';
+                    if (!isSelected) {
+                        if (dayOfWeek === 0) textColor = 'text-red-500';
+                        else if (dayOfWeek === 6) textColor = 'text-blue-600';
+                    }
+                    
+                    let bgClass = isSelected ? 'bg-blue-600 text-white shadow-md z-10 scale-105' : hasRecord ? 'bg-blue-50 font-bold border border-blue-100' : 'hover:bg-gray-50';
+                    
+                    days.push(
+                        <div key={d} onClick={() => setSelectedDate(current)}
+                             className={`h-14 flex flex-col items-center pt-1 cursor-pointer rounded-xl transition-all relative ${bgClass} ${isSelected ? '' : textColor}`}>
+                            <span className="text-xl font-bold leading-none">{d}</span>
+                            <div className="w-full px-0.5 mt-0.5 space-y-0.5 overflow-hidden">
+                                {dayRecords.slice(0, 1).map((h, i) => (
+                                    <span key={i} className={`text-[8px] leading-tight block truncate w-full text-center ${isSelected ? 'text-blue-100' : 'text-blue-700 font-bold'}`}>{h}</span>
+                                ))}
+                            </div>
+                        </div>
+                    );
+                }
+                return days;
+            };
+
+            // 에러 화면 처리
+            if (loadingError) {
+                return (
+                    <div className="flex flex-col items-center justify-center h-screen bg-slate-50 p-10 text-center">
+                        <div className="bg-red-50 p-4 rounded-full mb-4">
+                            <i data-lucide="alert-circle" className="text-red-500 w-8 h-8"></i>
+                        </div>
+                        <h2 className="text-lg font-bold text-slate-800 mb-2">연결 오류</h2>
+                        <p className="text-slate-500 text-sm mb-6">{loadingError}</p>
+                        <button 
+                            onClick={() => window.location.reload()}
+                            className="bg-blue-600 text-white px-6 py-2 rounded-xl font-bold shadow-md hover:bg-blue-700 transition-all"
+                        >
+                            다시 시도
+                        </button>
+                    </div>
+                );
+            }
+
+            // 로딩 화면 처리
+            if (!sdkReady || !user) {
+                return (
+                    <div className="flex flex-col items-center justify-center h-screen bg-slate-50 gap-4">
+                        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
+                        <p className="text-slate-400 text-sm font-bold">서버 연결 중...</p>
+                    </div>
+                );
+            }
+
+            const dateStr = formatDate(selectedDate);
+            const currentDayRecords = records[activeProfile]?.[dateStr] || [];
+
+            return (
+                <div className="flex flex-col h-screen max-w-md mx-auto bg-slate-50 text-slate-800 overflow-hidden border-x border-slate-200 relative">
+                    {activeProfile !== 'stats' && (
+                        <header className="bg-white px-6 pt-6 pb-4 shadow-sm rounded-b-[2.5rem] z-10 border-b border-slate-100">
+                            <div className="flex justify-between items-center mb-4">
+                                <div className="flex items-center">
+                                    <div className="w-1.5 h-6 bg-blue-500 rounded-full mr-2"></div>
+                                    <h1 className="text-xl font-black text-slate-900 tracking-tight">복약 기록</h1>
+                                </div>
+                                <div className="flex gap-2 text-center">
+                                    <div className="bg-blue-50 px-2.5 py-1 rounded-xl border border-blue-100 min-w-[50px]">
+                                        <p className="text-[8px] text-blue-400 font-bold">나</p>
+                                        <p className="text-sm font-black text-blue-600">{getUniqueDayCount('me')}<span className="text-[9px] font-normal text-slate-400 ml-0.5">일</span></p>
+                                    </div>
+                                    <div className="bg-indigo-50 px-2.5 py-1 rounded-xl border border-indigo-100 min-w-[50px]">
+                                        <p className="text-[8px] text-indigo-400 font-bold">아들</p>
+                                        <p className="text-sm font-black text-indigo-500">{getUniqueDayCount('son')}<span className="text-[9px] font-normal text-slate-400 ml-0.5">일</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="flex items-center justify-between mb-3 px-1">
+                                <h2 className="text-md font-bold text-slate-800">{viewDate.getFullYear()}년 {viewDate.getMonth() + 1}월</h2>
+                                <div className="flex gap-1 bg-slate-50 rounded-full p-0.5">
+                                    <button onClick={() => changeMonth(-1)} className="p-1 hover:bg-white hover:shadow-xs rounded-full transition-all"><i data-lucide="chevron-left" className="lucide"></i></button>
+                                    <button onClick={() => changeMonth(1)} className="p-1 hover:bg-white hover:shadow-xs rounded-full transition-all"><i data-lucide="chevron-right" className="lucide"></i></button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-7 mb-1 text-center text-[10px] font-extrabold tracking-tighter uppercase">
+                                {['일', '월', '화', '수', '목', '금', '토'].map((d, i) => (
+                                    <div key={d} className={i === 0 ? 'text-red-400' : i === 6 ? 'text-blue-400' : 'text-slate-300'}>{d}</div>
+                                ))}
+                            </div>
+                            <div className="grid grid-cols-7 gap-0.5">{renderCalendar()}</div>
+                        </header>
+                    )}
+
+                    <main className="flex-1 overflow-y-auto p-5 pb-24">
+                        {activeProfile === 'stats' ? (
+                            <div className="space-y-6 pt-2">
+                                <div className="flex items-center gap-2 mb-2">
+                                    <div className="w-1.5 h-6 bg-slate-900 rounded-full"></div>
+                                    <h3 className="font-black text-slate-900 text-xl">{currentYear}년 전체 누계</h3>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 text-center">
+                                        <div className="flex items-center justify-center gap-2 mb-3 border-b pb-3 text-blue-600">
+                                            <i data-lucide="user" className="lucide"></i><p className="text-base font-black">나의 기록</p>
+                                        </div>
+                                        <p className="text-3xl font-black text-blue-600 mb-4">{getUniqueDayCount('me')}<span className="text-sm font-normal text-slate-400 ml-1">일</span></p>
+                                        <div className="space-y-3">
+                                            {getRanking('me').map((item, idx) => (
+                                                <div key={idx} className="flex justify-between items-center text-sm font-bold text-slate-600">
+                                                    <span>{idx + 1}. {item.hospital}</span><span>{item.count}회</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 text-center">
+                                        <div className="flex items-center justify-center gap-2 mb-3 border-b pb-3 text-indigo-600">
+                                            <i data-lucide="baby" className="lucide"></i><p className="text-base font-black">아들 기록</p>
+                                        </div>
+                                        <p className="text-3xl font-black text-indigo-600 mb-4">{getUniqueDayCount('son')}<span className="text-sm font-normal text-slate-400 ml-1">일</span></p>
+                                        <div className="space-y-3">
+                                            {getRanking('son').map((item, idx) => (
+                                                <div key={idx} className="flex justify-between items-center text-sm font-bold text-slate-600">
+                                                    <span>{idx + 1}. {item.hospital}</span><span>{item.count}회</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100">
+                                    <p className="text-base font-black text-slate-400 uppercase mb-5 tracking-widest text-center">월별 복약 횟수 비교</p>
+                                    <table className="w-full text-lg text-center overflow-hidden rounded-2xl">
+                                        <thead className="bg-slate-50 text-slate-500 font-bold">
+                                            <tr><th className="py-4 border-b">월</th><th className="py-4 border-b text-blue-600">나</th><th className="py-4 border-b text-indigo-600">아들</th></tr>
+                                        </thead>
+                                        <tbody>
+                                            {getMonthlyStats().filter(s => s.me > 0 || s.son > 0).map((s) => (
+                                                <tr key={s.month} className="border-b border-slate-50 last:border-0 font-black text-slate-700">
+                                                    <td className="py-4 text-slate-500">{s.month}월</td><td>{s.me}회</td><td>{s.son}회</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        ) : (
+                            <>
+                                <div className="flex items-center justify-between mb-4">
+                                    <div className="flex items-center gap-2">
+                                        <div className="w-1.5 h-6 bg-blue-500 rounded-full"></div>
+                                        <h3 className="font-extrabold text-slate-800 text-sm">
+                                            {selectedDate.getMonth() + 1}/{selectedDate.getDate()} {profileNames[activeProfile]}
+                                        </h3>
+                                    </div>
+                                </div>
+                                <div className="flex flex-wrap gap-2 mb-4">
+                                    {currentDayRecords.map((h, i) => (
+                                        <div key={i} className="flex items-center gap-1.5 bg-blue-600 text-white px-3 py-1.5 rounded-xl text-[11px] font-bold shadow-sm animate-in fade-in slide-in-from-left-2">
+                                            {h}
+                                            <button onClick={() => deleteDayRecord(h)} className="p-0.5 hover:text-red-200 transition-colors"><i data-lucide="x" className="lucide"></i></button>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="bg-white p-5 rounded-[2rem] shadow-sm border border-slate-100">
+                                    <div className="flex flex-wrap gap-2.5">
+                                        {hospitals.map(hospital => (
+                                            <div key={hospital} className={`flex items-center border rounded-2xl pl-3 pr-1.5 py-1.5 transition-all ${currentDayRecords.includes(hospital) ? 'bg-blue-100 border-blue-200 text-blue-700 font-bold' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-blue-50 font-bold'}`}>
+                                                <button onClick={() => addRecord(hospital)} className="text-xs mr-2">{hospital}</button>
+                                                <button onClick={() => deleteHospitalKeyword(hospital)} className="p-0.5 text-slate-300 hover:text-red-500 transition-colors"><i data-lucide="x" className="lucide"></i></button>
+                                            </div>
+                                        ))}
+                                        <form onSubmit={addHospitalKeyword} className="flex items-center bg-white border-2 border-dashed border-slate-100 rounded-2xl px-3 py-1">
+                                            <input type="text" value={newKeyword} onChange={(e) => setNewKeyword(e.target.value)} placeholder="병원 추가" className="bg-transparent text-[11px] w-16 outline-none font-medium text-slate-500" />
+                                            <button type="submit" className="text-blue-400 ml-1"><i data-lucide="plus" className="lucide"></i></button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </main>
+
+                    {showToast && (
+                        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-900/90 backdrop-blur-sm text-white px-5 py-2.5 rounded-2xl text-xs font-bold z-50 shadow-2xl animate-in zoom-in">
+                            <div className="flex items-center gap-2"><i data-lucide="check-circle-2" className="text-green-400 lucide"></i>{showToast}</div>
+                        </div>
+                    )}
+
+                    <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white/95 backdrop-blur-md border-t border-slate-100 flex items-center rounded-t-[2.5rem] shadow-lg h-20">
+                        <button onClick={() => setSelectedProfile('me')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'me' ? 'text-blue-600' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'me' ? 'bg-blue-50' : ''}`}><i data-lucide="user" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">나의 기록</span>
+                        </button>
+                        <button onClick={() => setSelectedProfile('son')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'son' ? 'text-indigo-600' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'son' ? 'bg-indigo-50' : ''}`}><i data-lucide="baby" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">아들 기록</span>
+                        </button>
+                        <button onClick={() => setSelectedProfile('stats')} className={`flex-1 flex flex-col items-center gap-0.5 transition-all ${activeProfile === 'stats' ? 'text-slate-900' : 'text-slate-300'}`}>
+                            <div className={`p-2 rounded-xl ${activeProfile === 'stats' ? 'bg-slate-100' : ''}`}><i data-lucide="bar-chart-2" className="lucide"></i></div>
+                            <span className="text-[10px] font-black uppercase">누계</span>
+                        </button>
+                    </nav>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html><!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>복약 기록 앱</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel CDN -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons Library -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        window.FirebaseSDK = { initializeApp, getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;700;900&display=swap');
+        body { font-family: 'Pretendard', sans-serif; }
+        .lucide { width: 1em; height: 1em; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect, useRef } = React;
+
+        const App = () => {
+            const [sdkReady, setSdkReady] = useState(false);
+            const [user, setUser] = useState(null);
             const [activeProfile, setSelectedProfile] = useState('me');
             const [selectedDate, setSelectedDate] = useState(new Date());
             const [viewDate, setViewDate] = useState(new Date());
