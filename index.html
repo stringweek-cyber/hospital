@@ -31,17 +31,10 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useMemo, useEffect } = React;
-        const { initializeApp, getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot } = window.FirebaseSDK;
-
-        // Firebase 초기화 설정
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+        const { useState, useMemo, useEffect, useRef } = React;
 
         const App = () => {
+            const [sdkReady, setSdkReady] = useState(false);
             const [user, setUser] = useState(null);
             const [activeProfile, setSelectedProfile] = useState('me');
             const [selectedDate, setSelectedDate] = useState(new Date());
@@ -51,52 +44,85 @@
             const [newKeyword, setNewKeyword] = useState('');
             const [showToast, setShowToast] = useState(null);
 
+            // Firebase 인스턴스를 저장할 Ref
+            const firebaseRef = useRef({ db: null, auth: null });
+
             const profileNames = { me: '나의 기록', son: '아들 기록', stats: '전체 누계' };
             const currentYear = new Date().getFullYear();
 
-            // 1. 인증 처리
+            // 1. SDK 로드 확인 및 Firebase 초기화
             useEffect(() => {
+                const checkSDK = setInterval(() => {
+                    if (window.FirebaseSDK) {
+                        const { initializeApp, getAuth, getFirestore } = window.FirebaseSDK;
+                        
+                        try {
+                            const firebaseConfig = typeof __firebase_config !== 'undefined' 
+                                ? JSON.parse(__firebase_config) 
+                                : { apiKey: "fake-key" }; // 폴백
+                            
+                            const app = initializeApp(firebaseConfig);
+                            firebaseRef.current.auth = getAuth(app);
+                            firebaseRef.current.db = getFirestore(app);
+                            setSdkReady(true);
+                            clearInterval(checkSDK);
+                        } catch (e) {
+                            console.error("Firebase Init Error:", e);
+                            clearInterval(checkSDK);
+                        }
+                    }
+                }, 100);
+                return () => clearInterval(checkSDK);
+            }, []);
+
+            // 2. 인증 처리
+            useEffect(() => {
+                if (!sdkReady) return;
+                const { onAuthStateChanged, signInAnonymously, signInWithCustomToken } = window.FirebaseSDK;
+                const auth = firebaseRef.current.auth;
+
                 const initAuth = async () => {
-                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else {
-                        await signInAnonymously(auth);
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (e) {
+                        console.error("Auth Error:", e);
                     }
                 };
                 initAuth();
                 const unsubscribe = onAuthStateChanged(auth, setUser);
                 return () => unsubscribe();
-            }, []);
+            }, [sdkReady]);
 
-            // 2. 데이터 실시간 동기화 (Firestore -> State)
+            // 3. 데이터 실시간 동기화
             useEffect(() => {
-                if (!user) return;
+                if (!user || !sdkReady) return;
+                const { doc, onSnapshot } = window.FirebaseSDK;
+                const db = firebaseRef.current.db;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
 
-                // 복약 기록 리스너
                 const recordsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'records');
                 const unsubscribeRecords = onSnapshot(recordsDocRef, (docSnap) => {
-                    if (docSnap.exists()) {
-                        setRecords(docSnap.data());
-                    }
-                }, (error) => console.error("Records sync error:", error));
+                    if (docSnap.exists()) setRecords(docSnap.data());
+                }, (err) => console.error("Records sync fail:", err));
 
-                // 병원 목록 리스너
                 const hospitalsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals');
                 const unsubscribeHospitals = onSnapshot(hospitalsDocRef, (docSnap) => {
-                    if (docSnap.exists()) {
-                        setHospitals(docSnap.data().list);
-                    }
-                }, (error) => console.error("Hospitals sync error:", error));
+                    if (docSnap.exists()) setHospitals(docSnap.data().list);
+                }, (err) => console.error("Hospitals sync fail:", err));
 
                 return () => {
                     unsubscribeRecords();
                     unsubscribeHospitals();
                 };
-            }, [user]);
+            }, [user, sdkReady]);
 
             useEffect(() => {
                 if (window.lucide) window.lucide.createIcons();
-            }, [activeProfile, viewDate, selectedDate, records, user]);
+            }, [activeProfile, viewDate, selectedDate, records, user, sdkReady]);
 
             const formatDate = (date) => {
                 const y = date.getFullYear();
@@ -127,7 +153,10 @@
                     });
                     return filtered;
                 };
-                return { me: filterByYear(records.me), son: filterByYear(records.son) };
+                return { 
+                    me: filterByYear(records?.me || {}), 
+                    son: filterByYear(records?.son || {}) 
+                };
             }, [records, currentYear]);
 
             const getUniqueDayCount = (profile) => Object.keys(filteredRecords[profile] || {}).length;
@@ -147,23 +176,24 @@
                 ['me', 'son'].forEach(profile => {
                     Object.keys(filteredRecords[profile] || {}).forEach(dateStr => {
                         const month = parseInt(dateStr.split('-')[1], 10);
-                        stats[month - 1][profile] += filteredRecords[profile][dateStr].length;
+                        if (stats[month - 1]) stats[month - 1][profile] += filteredRecords[profile][dateStr].length;
                     });
                 });
                 return stats;
             };
 
-            // 3. 데이터 저장 함수 (State -> Firestore)
             const saveRecords = async (newRecords) => {
-                if (!user) return;
-                const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'records');
-                await setDoc(docRef, newRecords);
+                if (!user || !sdkReady) return;
+                const { doc, setDoc } = window.FirebaseSDK;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+                await setDoc(doc(firebaseRef.current.db, 'artifacts', appId, 'users', user.uid, 'data', 'records'), newRecords);
             };
 
             const saveHospitals = async (newList) => {
-                if (!user) return;
-                const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals');
-                await setDoc(docRef, { list: newList });
+                if (!user || !sdkReady) return;
+                const { doc, setDoc } = window.FirebaseSDK;
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
+                await setDoc(doc(firebaseRef.current.db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals'), { list: newList });
             };
 
             const addRecord = async (hospital) => {
@@ -184,13 +214,10 @@
             const deleteDayRecord = async (hospitalName) => {
                 const dateStr = formatDate(selectedDate);
                 const updatedList = (records[activeProfile]?.[dateStr] || []).filter(h => h !== hospitalName);
-                
                 const newProfileRecords = { ...records[activeProfile] };
                 if (updatedList.length === 0) delete newProfileRecords[dateStr];
                 else newProfileRecords[dateStr] = updatedList;
-
-                const updatedRecords = { ...records, [activeProfile]: newProfileRecords };
-                await saveRecords(updatedRecords);
+                await saveRecords({ ...records, [activeProfile]: newProfileRecords });
             };
 
             const addHospitalKeyword = async (e) => {
@@ -200,14 +227,12 @@
                     setNewKeyword('');
                     return;
                 }
-                const newList = [...hospitals, trimmed];
-                await saveHospitals(newList);
+                await saveHospitals([...hospitals, trimmed]);
                 setNewKeyword('');
             };
 
             const deleteHospitalKeyword = async (keyword) => {
-                const newList = hospitals.filter(h => h !== keyword);
-                await saveHospitals(newList);
+                await saveHospitals(hospitals.filter(h => h !== keyword));
             };
 
             const triggerToast = (msg) => {
@@ -255,10 +280,11 @@
                 return days;
             };
 
-            if (!user) {
+            if (!sdkReady || !user) {
                 return (
-                    <div className="flex items-center justify-center h-screen bg-slate-50">
-                        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+                    <div className="flex flex-col items-center justify-center h-screen bg-slate-50 gap-4">
+                        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600"></div>
+                        <p className="text-slate-400 text-sm font-bold">서버 연결 중...</p>
                     </div>
                 );
             }
