@@ -9,14 +9,21 @@
     <!-- React & ReactDOM CDN -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <!-- Babel CDN (JSX 컴파일용) -->
+    <!-- Babel CDN -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <!-- Lucide Icons Library -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        window.FirebaseSDK = { initializeApp, getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot };
+    </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;700;900&display=swap');
         body { font-family: 'Pretendard', sans-serif; }
-        /* Lucide 아이콘 크기 조절을 위한 클래스 */
         .lucide { width: 1em; height: 1em; }
     </style>
 </head>
@@ -25,9 +32,18 @@
 
     <script type="text/babel">
         const { useState, useMemo, useEffect } = React;
+        const { initializeApp, getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken, getFirestore, doc, setDoc, onSnapshot } = window.FirebaseSDK;
+
+        // Firebase 초기화 설정
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'medication-tracker';
 
         const App = () => {
-            const [activeProfile, setSelectedProfile] = useState('me'); // 'me', 'son', 'stats'
+            const [user, setUser] = useState(null);
+            const [activeProfile, setSelectedProfile] = useState('me');
             const [selectedDate, setSelectedDate] = useState(new Date());
             const [viewDate, setViewDate] = useState(new Date());
             const [records, setRecords] = useState({ me: {}, son: {} });
@@ -38,12 +54,50 @@
             const profileNames = { me: '나의 기록', son: '아들 기록', stats: '전체 누계' };
             const currentYear = new Date().getFullYear();
 
-            // 아이콘 렌더링을 위한 useEffect
+            // 1. 인증 처리
+            useEffect(() => {
+                const initAuth = async () => {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                };
+                initAuth();
+                const unsubscribe = onAuthStateChanged(auth, setUser);
+                return () => unsubscribe();
+            }, []);
+
+            // 2. 데이터 실시간 동기화 (Firestore -> State)
+            useEffect(() => {
+                if (!user) return;
+
+                // 복약 기록 리스너
+                const recordsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'records');
+                const unsubscribeRecords = onSnapshot(recordsDocRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        setRecords(docSnap.data());
+                    }
+                }, (error) => console.error("Records sync error:", error));
+
+                // 병원 목록 리스너
+                const hospitalsDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals');
+                const unsubscribeHospitals = onSnapshot(hospitalsDocRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        setHospitals(docSnap.data().list);
+                    }
+                }, (error) => console.error("Hospitals sync error:", error));
+
+                return () => {
+                    unsubscribeRecords();
+                    unsubscribeHospitals();
+                };
+            }, [user]);
+
             useEffect(() => {
                 if (window.lucide) window.lucide.createIcons();
-            }, [activeProfile, viewDate, selectedDate, records]);
+            }, [activeProfile, viewDate, selectedDate, records, user]);
 
-            // 로컬 시간 기준 날짜 포맷 (1월 1일 리셋 및 시간대 버그 방지)
             const formatDate = (date) => {
                 const y = date.getFullYear();
                 const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -59,9 +113,12 @@
             const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
             const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
 
-            // 1월 1일 기준 리셋을 위한 필터링 (현재 연도 데이터만)
+            const changeMonth = (offset) => {
+                setViewDate(prev => new Date(prev.getFullYear(), prev.getMonth() + offset, 1));
+            };
+
             const filteredRecords = useMemo(() => {
-                const filterByYear = (data) => {
+                const filterByYear = (data = {}) => {
                     const filtered = {};
                     Object.keys(data).forEach(dateStr => {
                         if (dateStr.startsWith(`${currentYear}-`)) {
@@ -73,11 +130,11 @@
                 return { me: filterByYear(records.me), son: filterByYear(records.son) };
             }, [records, currentYear]);
 
-            const getUniqueDayCount = (profile) => Object.keys(filteredRecords[profile]).length;
+            const getUniqueDayCount = (profile) => Object.keys(filteredRecords[profile] || {}).length;
 
             const getRanking = (profile) => {
                 const counts = {};
-                Object.values(filteredRecords[profile]).forEach(list => {
+                Object.values(filteredRecords[profile] || {}).forEach(list => {
                     list.forEach(h => { counts[h] = (counts[h] || 0) + 1; });
                 });
                 return Object.entries(counts)
@@ -88,7 +145,7 @@
             const getMonthlyStats = () => {
                 const stats = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, me: 0, son: 0 }));
                 ['me', 'son'].forEach(profile => {
-                    Object.keys(filteredRecords[profile]).forEach(dateStr => {
+                    Object.keys(filteredRecords[profile] || {}).forEach(dateStr => {
                         const month = parseInt(dateStr.split('-')[1], 10);
                         stats[month - 1][profile] += filteredRecords[profile][dateStr].length;
                     });
@@ -96,43 +153,61 @@
                 return stats;
             };
 
-            const addRecord = (hospital) => {
+            // 3. 데이터 저장 함수 (State -> Firestore)
+            const saveRecords = async (newRecords) => {
+                if (!user) return;
+                const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'records');
+                await setDoc(docRef, newRecords);
+            };
+
+            const saveHospitals = async (newList) => {
+                if (!user) return;
+                const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'hospitals');
+                await setDoc(docRef, { list: newList });
+            };
+
+            const addRecord = async (hospital) => {
                 const dateStr = formatDate(selectedDate);
-                const currentDayRecords = records[activeProfile][dateStr] || [];
+                const currentDayRecords = records[activeProfile]?.[dateStr] || [];
                 if (currentDayRecords.includes(hospital)) {
                     triggerToast('이미 기록된 병원입니다.');
                     return;
                 }
-                setRecords(prev => ({
-                    ...prev,
-                    [activeProfile]: { ...prev[activeProfile], [dateStr]: [...currentDayRecords, hospital] }
-                }));
+                const updatedRecords = {
+                    ...records,
+                    [activeProfile]: { ...records[activeProfile], [dateStr]: [...currentDayRecords, hospital] }
+                };
+                await saveRecords(updatedRecords);
                 triggerToast(`${hospital} 기록 완료!`);
             };
 
-            const deleteDayRecord = (hospitalName) => {
+            const deleteDayRecord = async (hospitalName) => {
                 const dateStr = formatDate(selectedDate);
-                const updatedList = records[activeProfile][dateStr].filter(h => h !== hospitalName);
-                setRecords(prev => {
-                    const newProfileRecords = { ...prev[activeProfile] };
-                    if (updatedList.length === 0) delete newProfileRecords[dateStr];
-                    else newProfileRecords[dateStr] = updatedList;
-                    return { ...prev, [activeProfile]: newProfileRecords };
-                });
+                const updatedList = (records[activeProfile]?.[dateStr] || []).filter(h => h !== hospitalName);
+                
+                const newProfileRecords = { ...records[activeProfile] };
+                if (updatedList.length === 0) delete newProfileRecords[dateStr];
+                else newProfileRecords[dateStr] = updatedList;
+
+                const updatedRecords = { ...records, [activeProfile]: newProfileRecords };
+                await saveRecords(updatedRecords);
             };
 
-            const addHospitalKeyword = (e) => {
+            const addHospitalKeyword = async (e) => {
                 e.preventDefault();
-                if (!newKeyword.trim() || hospitals.includes(newKeyword.trim())) {
+                const trimmed = newKeyword.trim();
+                if (!trimmed || hospitals.includes(trimmed)) {
                     setNewKeyword('');
                     return;
                 }
-                setHospitals([...hospitals, newKeyword.trim()]);
+                const newList = [...hospitals, trimmed];
+                await saveHospitals(newList);
                 setNewKeyword('');
             };
 
-            const deleteHospitalKeyword = (keyword) => {
-                setHospitals(hospitals.filter(h => h !== keyword));
+            const deleteHospitalKeyword = async (keyword) => {
+                const newList = hospitals.filter(h => h !== keyword);
+                await saveHospitals(newList);
             };
 
             const triggerToast = (msg) => {
@@ -147,20 +222,24 @@
                 const firstDay = getFirstDayOfMonth(year, month);
                 const days = [];
                 for (let i = 0; i < firstDay; i++) days.push(<div key={`empty-${i}`} className="h-14"></div>);
-                const currentProfile = activeProfile === 'stats' ? 'me' : activeProfile;
+                
+                const displayProfile = activeProfile === 'stats' ? 'me' : activeProfile;
                 for (let d = 1; d <= daysInMonth; d++) {
                     const current = new Date(year, month, d);
                     const isSelected = isSameDay(current, selectedDate);
                     const dateStr = formatDate(current);
-                    const dayRecords = filteredRecords[currentProfile][dateStr] || [];
+                    const dayRecords = filteredRecords[displayProfile]?.[dateStr] || [];
                     const hasRecord = dayRecords.length > 0;
                     const dayOfWeek = current.getDay();
+                    
                     let textColor = 'text-slate-700';
                     if (!isSelected) {
                         if (dayOfWeek === 0) textColor = 'text-red-500';
                         else if (dayOfWeek === 6) textColor = 'text-blue-600';
                     }
+                    
                     let bgClass = isSelected ? 'bg-blue-600 text-white shadow-md z-10 scale-105' : hasRecord ? 'bg-blue-50 font-bold border border-blue-100' : 'hover:bg-gray-50';
+                    
                     days.push(
                         <div key={d} onClick={() => setSelectedDate(current)}
                              className={`h-14 flex flex-col items-center pt-1 cursor-pointer rounded-xl transition-all relative ${bgClass} ${isSelected ? '' : textColor}`}>
@@ -176,11 +255,19 @@
                 return days;
             };
 
+            if (!user) {
+                return (
+                    <div className="flex items-center justify-center h-screen bg-slate-50">
+                        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+                    </div>
+                );
+            }
+
             const dateStr = formatDate(selectedDate);
-            const currentDayRecords = filteredRecords[activeProfile]?.[dateStr] || [];
+            const currentDayRecords = records[activeProfile]?.[dateStr] || [];
 
             return (
-                <div className="flex flex-col h-screen max-w-md mx-auto bg-slate-50 text-slate-800 overflow-hidden border-x border-slate-200">
+                <div className="flex flex-col h-screen max-w-md mx-auto bg-slate-50 text-slate-800 overflow-hidden border-x border-slate-200 relative">
                     {activeProfile !== 'stats' && (
                         <header className="bg-white px-6 pt-6 pb-4 shadow-sm rounded-b-[2.5rem] z-10 border-b border-slate-100">
                             <div className="flex justify-between items-center mb-4">
